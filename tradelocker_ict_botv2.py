@@ -6,6 +6,10 @@ import requests
 from datetime import datetime
 import pytz
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from dotenv import load_dotenv  # Thư viện đọc file cấu hình bảo mật
+
+# KÍCH HOẠT TỰ ĐỘNG NẠP CHÌA KHÓA BẢO MẬT
+load_dotenv()
 
 # ============================================================
 # CẤU HÌNH HỆ THỐNG & BIẾN MÔI TRƯỜNG
@@ -14,7 +18,6 @@ ACCESS_TOKEN_TTL = 25 * 60  # Làm mới Access Token sau mỗi 25 phút
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
-# NÂNG CẤP BẢO MẬT: Bốc trực tiếp mã khóa từ bảng cấu hình Environment Variables của Render
 REFRESH_TOKEN      = os.environ.get("REFRESH_TOKEN")
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "trade_log.csv")
@@ -309,13 +312,13 @@ class TradeLockerTokenBot:
         url = "https://auth.tradelocker.com/realms/tradelocker/protocol/openid-connect/token"
         
         if not REFRESH_TOKEN:
-            print("❌ Không tìm thấy mã REFRESH_TOKEN trong Biến môi trường Render.")
+            print("❌ Không tìm thấy mã REFRESH_TOKEN trong hệ thống.")
             return
 
         payload = {
             "grant_type": "refresh_token",
             "client_id": "frontend-web-demo",
-            "refresh_token": REFRESH_TOKEN,
+            "refresh_token": REFRESH_TOKEN.strip(),
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
@@ -376,7 +379,6 @@ class TradeLockerTokenBot:
             print(f"❌ Lỗi xử lý dữ liệu tài khoản sau đăng nhập: {e}")
 
     def get_candles(self, symbol):
-        # MỞ RỘNG TẦM NHÌN: Tăng count từ 20 lên 50 nến để bao quát đủ quá khứ Kill Zone
         url = f"{BASE_URL}/market/candles?symbol={symbol}&resolution=1m&count=50"
         headers = {"Authorization": f"Bearer {self.access_token}"}
         try:
@@ -446,14 +448,12 @@ class TradeLockerTokenBot:
 
     def check_smt_divergence(self, nas_candles, es_candles):
         """THUẬT TOÁN ICT: LIQUIDITY SWEPT + SMT DIVERGENCE XÁC NHẬN (BẢN UPDATE TẦM NHÌN 30 PHÚT)"""
-        # Đảm bảo nhận đủ dữ liệu nến cho thấu kính rộng hơn
         if not nas_candles or not es_candles or len(nas_candles) < 35 or len(es_candles) < 35:
             return None, None
 
         nas_curr = nas_candles[0]
         es_curr  = es_candles[0]
 
-        # NÂNG CẤP XỊN: Quét tìm đỉnh/đáy trong vòng 30 cây nến trước (30 phút) thay vì chỉ nhìn 5 nến
         nas_prev_low  = min(c["low"]  for c in nas_candles[1:31])
         nas_prev_high = max(c["high"] for c in nas_candles[1:31])
         es_prev_low   = min(c["low"]  for c in es_candles[1:31])
