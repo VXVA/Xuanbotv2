@@ -30,7 +30,7 @@ RISK_USD = 25.0                        # Rủi ro mặc định $25
 SYMBOL = "NAS100"                      # Mã giao dịch chính
 SYMBOL_ES = "SPX500"                   # Mã đối chứng SMT
 
-BASE_URL = "https://demo.tradelocker.com/api/v1"
+BASE_URL = "https://tradelocker.com/api/v1"
 
 
 def send_telegram(message: str):
@@ -317,7 +317,7 @@ class TradeLockerTokenBot:
 
         payload = {
             "grant_type": "refresh_token",
-            "client_id": "frontend-web-demo",
+            "client_id": "frontend-web-live",
             "refresh_token": REFRESH_TOKEN.strip(),
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
