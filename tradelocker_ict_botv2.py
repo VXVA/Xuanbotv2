@@ -14,12 +14,12 @@ ACCESS_TOKEN_TTL = 25 * 60  # Làm mới Access Token sau mỗi 25 phút
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
+# NÂNG CẤP BẢO MẬT: Bốc trực tiếp mã khóa từ bảng cấu hình Environment Variables của Render
+REFRESH_TOKEN      = os.environ.get("REFRESH_TOKEN")
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "trade_log.csv")
 LOG_HEADERS = ["datetime_ny", "symbol", "side", "lot", "entry_price", "stop_loss", "take_profit", "risk_usd"]
 DAILY_SUMMARY_HOUR = 23  # Gửi tóm tắt ngày lúc 11 giờ đêm giờ New York
-
-REFRESH_TOKEN = "eyJhbGciOiJIUzUxMiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJlNGVjYzhkNy01NjcxLTQxZWQtOTUwYy1hZDVhNTIxMzgxMDIifQ.eyJleHAiOjE3ODI0ODM4MzUsImlhdCI6MTc3OTg5MTgzNSwianRpIjoiMjVkYzQzZWMtOWM5Yy0yNjVmLTRlNzItMjllMDNjNDZiYzBlIiwiaXNzIjoiaHR0cHM6Ly9hdXRoLnRyYWRlbG9ja2VyLmNvbS9yZWFsbXMvdHJhZGVsb2NrZXIiLCJhdWQiOiJodHRwczovL2F1dGgudHJhZGVsb2NrZXIuY29tL3JlYWxtcy90cmFkZWxvY2tlciIsInN1YiI6ImY0MDA0NTJiLTMzZGQtNDA2OC04NTY4LWY2YTA4NDExZWNkOCIsInR5cCI6IlJlZnJlc2giLCJhenAiOiJmcm9udGVuZC13ZWItbGl2ZSIsInNpZCI6IjBiNjdjZDViLTA2MjYtNmU5My1mZjE4LTg5ZGI0MDQzMzJlMCIsInNjb3BlIjoib3BlbmlkIGJhc2ljIGZyb250ZW5kLWF1ZGllbmNlIHJvbGVzIHdlYi1vcmlnaW5zIHByb2ZpbGUgRnJvbnRlbmRfQ2xpZW50X1Njb3BlIn0.8vtoUiWK9l4trPM-P2JqEYQhufCs61tVRRUfu-WT8FVtZvxWXxJxLsnM2mRn-_lmXwWv3WB6ah2edbWNNWaI5A"
 
 ACCOUNT_ID = "vietanh9a2k5@gmail.com"  # Email đăng nhập của bạn
 SERVER = "BLUEG"                       # Mã server quỹ Blue Guardian
@@ -307,6 +307,11 @@ class TradeLockerTokenBot:
 
     def authenticate_with_token(self):
         url = "https://auth.tradelocker.com/realms/tradelocker/protocol/openid-connect/token"
+        
+        if not REFRESH_TOKEN:
+            print("❌ Không tìm thấy mã REFRESH_TOKEN trong Biến môi trường Render.")
+            return
+
         payload = {
             "grant_type": "refresh_token",
             "client_id": "frontend-web-demo",
