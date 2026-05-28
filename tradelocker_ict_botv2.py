@@ -561,10 +561,19 @@ def poll_telegram_commands(bot_ref):
 
 
 class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _respond_ok(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "2")
         self.end_headers()
+
+    def do_GET(self):
+        self._respond_ok()
         self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        # UptimeRobot và nhiều monitor khác dùng HEAD thay vì GET
+        self._respond_ok()
 
     def log_message(self, format, *args):
         pass
