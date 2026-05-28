@@ -1,9 +1,11 @@
+import base64
 import csv
+import json
 import os
 import threading
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv  # Thư viện đọc file cấu hình bảo mật
@@ -21,8 +23,11 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 REFRESH_TOKEN      = os.environ.get("REFRESH_TOKEN")
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "trade_log.csv")
-LOG_HEADERS = ["datetime_ny", "symbol", "side", "lot", "entry_price", "stop_loss", "take_profit", "risk_usd"]
+LOG_HEADERS = ["datetime_ny", "symbol", "side", "lot", "entry_price", "stop_loss", "take_profit", "risk_usd", "order_id", "outcome", "pnl_usd", "close_time"]
 DAILY_SUMMARY_HOUR = 23  # Gửi tóm tắt ngày lúc 11 giờ đêm giờ New York
+
+MAX_TRADES_PER_DAY = 3       # Giới hạn số lệnh tối đa mỗi ngày
+DAILY_LOSS_LIMIT   = 75.0    # Tạm dừng bot nếu tổng rủi ro vượt mức này ($)
 
 ACCOUNT_ID = "vietanh9a2k5@gmail.com"  # Email đăng nhập của bạn
 SERVER = "BLUEG"                       # Mã server quỹ Blue Guardian
@@ -48,6 +53,21 @@ def send_telegram(message: str):
         print(f"⚠️ Không gửi được Telegram: {e}")
 
 
+def get_refresh_token_days_left() -> int | None:
+    """Giải mã JWT để tính số ngày còn lại trước khi Refresh Token hết hạn."""
+    try:
+        payload_b64 = REFRESH_TOKEN.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp_ts = payload.get("exp")
+        if not exp_ts:
+            return None
+        days_left = (exp_ts - datetime.now(timezone.utc).timestamp()) / 86400
+        return int(days_left)
+    except Exception:
+        return None
+
+
 def send_daily_summary():
     """Đọc trade_log.csv và gửi tóm tắt kết quả ngày hôm nay lên Telegram"""
     tz_ny = pytz.timezone("America/New_York")
@@ -68,6 +88,8 @@ def send_daily_summary():
                             "stop_loss":   float(row["stop_loss"]),
                             "take_profit": float(row["take_profit"]),
                             "risk_usd":    float(row["risk_usd"]),
+                            "outcome":     row.get("outcome", ""),
+                            "pnl_usd":     float(row["pnl_usd"]) if row.get("pnl_usd") else None,
                         })
                     except (ValueError, KeyError):
                         continue
@@ -80,28 +102,90 @@ def send_daily_summary():
         )
         return
 
-    total       = len(trades_today)
-    buys        = sum(1 for t in trades_today if t["side"] == "BUY")
-    sells       = total - buys
-    total_risk  = sum(t["risk_usd"] for t in trades_today)
-    max_profit  = total_risk * 2.0   
-    max_loss    = total_risk          
-    avg_lot     = sum(t["lot"] for t in trades_today) / total
+    total      = len(trades_today)
+    buys       = sum(1 for t in trades_today if t["side"] == "BUY")
+    sells      = total - buys
+    total_risk = sum(t["risk_usd"] for t in trades_today)
+    avg_lot    = sum(t["lot"] for t in trades_today) / total
+
+    closed     = [t for t in trades_today if t["outcome"] in ("TP", "SL")]
+    wins       = [t for t in closed if t["outcome"] == "TP"]
+    losses     = [t for t in closed if t["outcome"] == "SL"]
+    real_pnl   = sum(t["pnl_usd"] for t in closed if t["pnl_usd"] is not None)
+    win_rate   = (len(wins) / len(closed) * 100) if closed else None
 
     lines = [f"📋 <b>TÓM TẮT NGÀY {today_label}</b>\n"]
-    lines.append(f"📊 Tổng lệnh hôm nay : <b>{total}</b>  (🟢 BUY {buys}  |  🔴 SELL {sells})")
-    lines.append(f"📦 Lot trung bình     : <b>{avg_lot:.2f}</b>")
-    lines.append(f"💰 Tổng rủi ro triển khai : <b>${total_risk:,.2f}</b>")
-    lines.append(f"")
-    lines.append(f"<b>Kịch bản kết quả (ước tính):</b>")
-    lines.append(f"  ✅ Nếu tất cả chạm TP : <b>+${max_profit:,.2f}</b>")
-    lines.append(f"  ❌ Nếu tất cả chạm SL : <b>-${max_loss:,.2f}</b>")
-    lines.append(f"  ⚖️ Điểm hòa vốn       : <b>33.3% win rate</b>")
-    lines.append(f"")
+    lines.append(f"📊 Tổng lệnh: <b>{total}</b>  (🟢 BUY {buys}  |  🔴 SELL {sells})")
+    lines.append(f"📦 Lot trung bình: <b>{avg_lot:.2f}</b>")
+    lines.append(f"💰 Tổng rủi ro triển khai: <b>${total_risk:,.2f}</b>")
+    lines.append("")
+
+    if closed:
+        pnl_emoji = "✅" if real_pnl >= 0 else "❌"
+        lines.append(f"<b>Kết quả thực tế ({len(closed)}/{total} lệnh đã đóng):</b>")
+        lines.append(f"  🏆 Thắng: <b>{len(wins)}</b>  |  💀 Thua: <b>{len(losses)}</b>")
+        lines.append(f"  📈 Win rate: <b>{win_rate:.0f}%</b>")
+        lines.append(f"  {pnl_emoji} P&L thực tế: <b>${real_pnl:+,.2f}</b>")
+    else:
+        max_profit = total_risk * 2.0
+        lines.append(f"<b>Kịch bản (chưa có lệnh đóng):</b>")
+        lines.append(f"  ✅ Nếu tất cả chạm TP: <b>+${max_profit:,.2f}</b>")
+        lines.append(f"  ❌ Nếu tất cả chạm SL: <b>-${total_risk:,.2f}</b>")
+
+    lines.append("")
     lines.append(f"🤖 Bot tiếp tục chạy và sẵn sàng cho phiên tiếp theo.")
 
     send_telegram("\n".join(lines))
     print(f"📨 Đã gửi tóm tắt ngày {today_label} lên Telegram.")
+
+
+def send_weekly_summary():
+    """Gửi tóm tắt tuần lên Telegram"""
+    tz_ny = pytz.timezone("America/New_York")
+    now_ny = datetime.now(tz_ny)
+    week_start = now_ny.strftime("%d/%m")
+
+    trades = []
+    if os.path.isfile(LOG_FILE):
+        cutoff = time.time() - 7 * 86400
+        with open(LOG_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    dt = datetime.strptime(row["datetime_ny"], "%Y-%m-%d %H:%M:%S")
+                    dt = pytz.timezone("America/New_York").localize(dt)
+                    if dt.timestamp() >= cutoff:
+                        trades.append({
+                            "side":     row["side"],
+                            "risk_usd": float(row["risk_usd"]),
+                            "outcome":  row.get("outcome", ""),
+                            "pnl_usd":  float(row["pnl_usd"]) if row.get("pnl_usd") else None,
+                        })
+                except (ValueError, KeyError):
+                    continue
+
+    if not trades:
+        send_telegram(f"📅 <b>TÓM TẮT TUẦN</b>\n\n😴 Không có lệnh nào trong 7 ngày qua.")
+        return
+
+    total      = len(trades)
+    closed     = [t for t in trades if t["outcome"] in ("TP", "SL")]
+    wins       = [t for t in closed if t["outcome"] == "TP"]
+    losses     = [t for t in closed if t["outcome"] == "SL"]
+    real_pnl   = sum(t["pnl_usd"] for t in closed if t["pnl_usd"] is not None)
+    total_risk = sum(t["risk_usd"] for t in trades)
+    win_rate   = (len(wins) / len(closed) * 100) if closed else 0
+    pnl_emoji  = "✅" if real_pnl >= 0 else "❌"
+
+    send_telegram(
+        f"📅 <b>TÓM TẮT TUẦN (7 ngày qua)</b>\n\n"
+        f"📊 Tổng lệnh: <b>{total}</b>\n"
+        f"💰 Tổng rủi ro: <b>${total_risk:,.2f}</b>\n\n"
+        f"<b>Kết quả ({len(closed)} lệnh đã đóng):</b>\n"
+        f"  🏆 Thắng: <b>{len(wins)}</b>  |  💀 Thua: <b>{len(losses)}</b>\n"
+        f"  📈 Win rate: <b>{win_rate:.0f}%</b>\n"
+        f"  {pnl_emoji} P&L thực tế: <b>${real_pnl:+,.2f}</b>"
+    )
 
 
 def count_trades_today():
@@ -120,6 +204,27 @@ def count_trades_today():
     except:
         pass
     return count
+
+
+def risk_deployed_today():
+    """Tính tổng rủi ro đã triển khai hôm nay ($)"""
+    if not os.path.isfile(LOG_FILE):
+        return 0.0
+    tz_ny = pytz.timezone("America/New_York")
+    today_str = datetime.now(tz_ny).strftime("%Y-%m-%d")
+    total = 0.0
+    try:
+        with open(LOG_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("datetime_ny", "").startswith(today_str):
+                    try:
+                        total += float(row["risk_usd"])
+                    except (ValueError, KeyError):
+                        pass
+    except:
+        pass
+    return total
 
 
 def poll_telegram_commands(bot_ref):
@@ -185,7 +290,8 @@ def poll_telegram_commands(bot_ref):
                         f"{trade_status}\n"
                         f"{zone_status}\n\n"
                         f"{token_line}\n"
-                        f"📊 Lệnh hôm nay: <b>{trades_today}</b>\n"
+                        f"📊 Lệnh hôm nay: <b>{trades_today}/{bot_ref.max_trades_per_day}</b>\n"
+                        f"🛡️ Rủi ro hôm nay: <b>${risk_deployed_today():,.2f}</b> / giới hạn <b>${bot_ref.daily_loss_limit:,.2f}</b>\n"
                         f"💎 Symbol: <b>{SYMBOL}</b>  |  Risk/lệnh: <b>${bot_ref.risk_usd}</b>"
                     )
 
@@ -244,13 +350,95 @@ def poll_telegram_commands(bot_ref):
                 elif text == "/help":
                     send_telegram(
                         "🤖 <b>DANH SÁCH LỆNH BOT ICT PRO MAX</b>\n\n"
-                        "📡 /status — Xem trạng thái bot, kill zone, token, risk hiện tại\n"
-                        "📋 /today — Xem toàn bộ lệnh đã vào hôm nay\n"
+                        "📡 /status — Xem trạng thái bot, kill zone, token, risk\n"
+                        "📋 /today — Xem lệnh + P&L thực tế hôm nay\n"
+                        "📅 /week — Xem tóm tắt kết quả 7 ngày qua\n"
                         "⏸️ /pause — Tạm dừng vào lệnh mới\n"
                         "▶️ /resume — Tiếp tục giao dịch bình thường\n"
                         "⚙️ /risk &lt;số&gt; — Đổi risk mỗi lệnh (vd: /risk 15)\n"
+                        "🛡️ /limit &lt;số&gt; — Đặt giới hạn rủi ro ngày (vd: /limit 75)\n"
+                        "🔢 /maxtr &lt;số&gt; — Đặt max lệnh/ngày (vd: /maxtr 3)\n"
+                        "🔑 /token — Kiểm tra hạn Refresh Token\n"
                         "❓ /help — Hiển thị danh sách lệnh này"
                     )
+
+                elif text == "/week":
+                    send_weekly_summary()
+
+                elif text.startswith("/limit"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        send_telegram(
+                            f"🛡️ Cú pháp: <b>/limit &lt;số tiền&gt;</b>\n"
+                            f"Ví dụ: /limit 75\n"
+                            f"Giới hạn hiện tại: <b>${bot_ref.daily_loss_limit:,.2f}</b>"
+                        )
+                    else:
+                        try:
+                            new_limit = float(parts[1])
+                            if new_limit <= 0:
+                                raise ValueError
+                            old_limit = bot_ref.daily_loss_limit
+                            bot_ref.daily_loss_limit = new_limit
+                            send_telegram(
+                                f"🛡️ <b>ĐÃ CẬP NHẬT GIỚI HẠN RỦI RO NGÀY</b>\n\n"
+                                f"Cũ: <b>${old_limit:,.2f}</b>  →  Mới: <b>${new_limit:,.2f}</b>\n"
+                                f"Bot sẽ tự tạm dừng khi tổng rủi ro ngày vượt mức này."
+                            )
+                        except (ValueError, IndexError):
+                            send_telegram("❌ Giá trị không hợp lệ. Ví dụ: /limit 75")
+
+                elif text.startswith("/maxtr"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        send_telegram(
+                            f"🔢 Cú pháp: <b>/maxtr &lt;số lệnh&gt;</b>\n"
+                            f"Ví dụ: /maxtr 3\n"
+                            f"Giới hạn hiện tại: <b>{bot_ref.max_trades_per_day} lệnh/ngày</b>"
+                        )
+                    else:
+                        try:
+                            new_max = int(parts[1])
+                            if new_max <= 0:
+                                raise ValueError
+                            old_max = bot_ref.max_trades_per_day
+                            bot_ref.max_trades_per_day = new_max
+                            send_telegram(
+                                f"🔢 <b>ĐÃ CẬP NHẬT MAX LỆNH/NGÀY</b>\n\n"
+                                f"Cũ: <b>{old_max}</b>  →  Mới: <b>{new_max}</b>\n"
+                                f"Bot sẽ dừng vào lệnh sau khi đạt {new_max} lệnh hôm nay."
+                            )
+                        except (ValueError, IndexError):
+                            send_telegram("❌ Giá trị không hợp lệ. Ví dụ: /maxtr 3")
+
+                elif text == "/token":
+                    days_left = get_refresh_token_days_left()
+                    if days_left is None:
+                        send_telegram("❌ Không thể đọc thông tin Refresh Token.")
+                    elif days_left <= 0:
+                        send_telegram(
+                            "🚨 <b>REFRESH TOKEN ĐÃ HẾT HẠN!</b>\n\n"
+                            "Bot sẽ không thể xác thực được nữa.\n\n"
+                            "<b>Cách lấy token mới:</b>\n"
+                            "1. Mở Chrome → vào <b>tradelocker.com</b> và đăng nhập\n"
+                            "2. Nhấn <b>F12</b> → chọn tab <b>Application</b>\n"
+                            "3. Bên trái chọn <b>Local Storage</b> → click vào tradelocker.com\n"
+                            "4. Tìm key <b>refresh_token</b> → copy giá trị\n"
+                            "5. Vào Render → <b>Environment</b> → cập nhật <b>REFRESH_TOKEN</b> → Save"
+                        )
+                    elif days_left <= 3:
+                        send_telegram(
+                            f"⚠️ <b>REFRESH TOKEN SẮP HẾT HẠN!</b>\n\n"
+                            f"Còn <b>{days_left} ngày</b> — cần cập nhật sớm!\n\n"
+                            "<b>Cách lấy token mới:</b>\n"
+                            "1. Mở Chrome → vào <b>tradelocker.com</b> và đăng nhập\n"
+                            "2. Nhấn <b>F12</b> → chọn tab <b>Application</b>\n"
+                            "3. Bên trái chọn <b>Local Storage</b> → click vào tradelocker.com\n"
+                            "4. Tìm key <b>refresh_token</b> → copy giá trị\n"
+                            "5. Vào Render → <b>Environment</b> → cập nhật <b>REFRESH_TOKEN</b> → Save"
+                        )
+                    else:
+                        send_telegram(f"🔑 Refresh Token còn hiệu lực: <b>{days_left} ngày</b> ✅")
 
                 elif text == "/today":
                     tz_ny = pytz.timezone("America/New_York")
@@ -269,17 +457,35 @@ def poll_telegram_commands(bot_ref):
                     else:
                         lines = [f"📋 <b>LỆNH HÔM NAY — {today_label}</b> ({len(trades_today)} lệnh)\n"]
                         total_risk = 0.0
+                        real_pnl   = 0.0
                         for i, t in enumerate(trades_today, 1):
-                            side = t["side"]
-                            emoji = "🟢" if side == "BUY" else "🔴"
+                            side    = t["side"]
+                            emoji   = "🟢" if side == "BUY" else "🔴"
                             time_str = t["datetime_ny"][11:16]
-                            risk = float(t["risk_usd"])
+                            risk    = float(t["risk_usd"])
                             total_risk += risk
+                            outcome = t.get("outcome", "")
+                            pnl_str = ""
+                            if outcome == "TP":
+                                pnl = float(t["pnl_usd"]) if t.get("pnl_usd") else 0
+                                real_pnl += pnl
+                                pnl_str = f"  ✅ TP  <b>+${pnl:,.2f}</b>"
+                            elif outcome == "SL":
+                                pnl = float(t["pnl_usd"]) if t.get("pnl_usd") else 0
+                                real_pnl += pnl
+                                pnl_str = f"  ❌ SL  <b>${pnl:,.2f}</b>"
+                            else:
+                                pnl_str = "  ⏳ Đang mở"
                             lines.append(
-                                f"{emoji} <b># {i} {side}</b>  {time_str} NY\n"
-                                f"   Entry <b>{t['entry_price']}</b>  SL <b>{t['stop_loss']}</b>  TP <b>{t['take_profit']}</b>  Lot <b>{t['lot']}</b>"
+                                f"{emoji} <b>#{i} {side}</b>  {time_str} NY\n"
+                                f"   Entry <b>{t['entry_price']}</b>  SL <b>{t['stop_loss']}</b>  TP <b>{t['take_profit']}</b>  Lot <b>{t['lot']}</b>\n"
+                                f"  {pnl_str}"
                             )
-                        lines.append(f"\n💰 Tổng rủi ro hôm nay: <b>${total_risk:,.2f}</b>")
+                        lines.append(f"\n💰 Tổng rủi ro: <b>${total_risk:,.2f}</b>")
+                        closed_today = [t for t in trades_today if t.get("outcome") in ("TP", "SL")]
+                        if closed_today:
+                            pnl_emoji = "✅" if real_pnl >= 0 else "❌"
+                            lines.append(f"{pnl_emoji} P&L thực tế: <b>${real_pnl:+,.2f}</b>")
                         send_telegram("\n".join(lines))
 
         except Exception as e:
@@ -300,12 +506,17 @@ class _Health(BaseHTTPRequestHandler):
 
 class TradeLockerTokenBot:
     def __init__(self):
-        self.access_token = None
-        self.acc_id = None
-        self.last_auth_time = None
-        self.last_summary_date = None  
-        self.paused = False            
-        self.risk_usd = RISK_USD       
+        self.access_token       = None
+        self.acc_id             = None
+        self.last_auth_time     = None
+        self.last_summary_date  = None
+        self.paused             = False
+        self.risk_usd           = RISK_USD
+        self.daily_loss_limit   = DAILY_LOSS_LIMIT
+        self.max_trades_per_day = MAX_TRADES_PER_DAY
+        self.open_positions     = {}   # order_id -> {side, entry, sl, tp, lot, risk_usd, row_datetime}
+        self.consecutive_wins   = 0
+        self.consecutive_losses = 0
         self.authenticate_with_token()
 
     def authenticate_with_token(self):
@@ -331,11 +542,24 @@ class TradeLockerTokenBot:
                 print(f"🔑 Access Token được làm mới lúc {datetime.now().strftime('%H:%M:%S')}")
                 self.get_account_details()
             else:
-                print(f"❌ Mã Refresh Token hết hạn hoặc sai cấu hình. Mã lỗi: {response.status_code}")
+                msg = f"❌ Mã Refresh Token hết hạn hoặc sai cấu hình. Mã lỗi: {response.status_code}"
+                print(msg)
+                send_telegram(
+                    f"🚨 <b>LỖI XÁC THỰC BOT!</b>\n\n"
+                    f"Không thể làm mới Access Token.\n"
+                    f"Mã lỗi: <b>{response.status_code}</b>\n\n"
+                    f"Nếu lỗi 400: Refresh Token đã hết hạn — cần cập nhật token mới trong Render."
+                )
         except Exception as e:
             print(f"❌ Không thể kết nối đến tổng đài xác thực: {e}")
+            send_telegram(
+                f"🚨 <b>LỖI KẾT NỐI XÁC THỰC!</b>\n\n"
+                f"Bot không thể kết nối đến TradeLocker để làm mới token.\n"
+                f"Lỗi: <code>{e}</code>\n\n"
+                f"Bot sẽ tự thử lại sau 10 giây."
+            )
 
-    def log_trade(self, side, entry_price, sl_price, tp_price, lot):
+    def log_trade(self, side, entry_price, sl_price, tp_price, lot, order_id=""):
         tz_ny = pytz.timezone("America/New_York")
         timestamp = datetime.now(tz_ny).strftime("%Y-%m-%d %H:%M:%S")
         file_exists = os.path.isfile(LOG_FILE)
@@ -345,15 +569,118 @@ class TradeLockerTokenBot:
                 writer.writeheader()
             writer.writerow({
                 "datetime_ny": timestamp,
-                "symbol": SYMBOL,
-                "side": side.upper(),
-                "lot": lot,
+                "symbol":      SYMBOL,
+                "side":        side.upper(),
+                "lot":         lot,
                 "entry_price": round(entry_price, 2),
-                "stop_loss": round(sl_price, 2),
+                "stop_loss":   round(sl_price, 2),
                 "take_profit": round(tp_price, 2),
-                "risk_usd": self.risk_usd,
+                "risk_usd":    self.risk_usd,
+                "order_id":    order_id,
+                "outcome":     "",
+                "pnl_usd":     "",
+                "close_time":  "",
             })
         print(f"   ➔ Đã lưu lệnh vào nhật ký: trade_log.csv")
+
+    def get_open_positions(self):
+        """Lấy danh sách lệnh đang mở từ sàn"""
+        if not self.acc_id or not self.access_token:
+            return []
+        url = f"{BASE_URL}/trade/positions?accId={self.acc_id}"
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                return res.json().get("positions", [])
+        except Exception as e:
+            print(f"⚠️ Lỗi lấy vị thế mở: {e}")
+        return []
+
+    def update_trade_outcome(self, order_id: str, outcome: str, pnl_usd: float):
+        """Cập nhật kết quả lệnh (TP/SL) vào trade_log.csv"""
+        if not os.path.isfile(LOG_FILE):
+            return
+        tz_ny = pytz.timezone("America/New_York")
+        close_time = datetime.now(tz_ny).strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        updated = False
+        with open(LOG_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("order_id") == str(order_id) and row.get("outcome") == "":
+                    row["outcome"]    = outcome
+                    row["pnl_usd"]    = round(pnl_usd, 2)
+                    row["close_time"] = close_time
+                    updated = True
+                rows.append(row)
+        if updated:
+            with open(LOG_FILE, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"   ➔ Cập nhật kết quả lệnh {order_id}: {outcome}  P&L=${pnl_usd:+.2f}")
+
+    def poll_open_positions(self):
+        """Kiểm tra lệnh đang mở — phát hiện khi TP/SL bị chạm"""
+        if not self.open_positions:
+            return
+        live_positions = self.get_open_positions()
+        live_ids = {str(p.get("id")) for p in live_positions}
+
+        for order_id, pos in list(self.open_positions.items()):
+            if str(order_id) not in live_ids:
+                # Lệnh đã đóng — xác định TP hay SL
+                entry  = pos["entry"]
+                sl     = pos["sl"]
+                tp     = pos["tp"]
+                side   = pos["side"]
+                risk   = pos["risk_usd"]
+
+                # Tính P&L ước tính dựa trên TP/SL ratio 1:2
+                if side == "buy":
+                    outcome = "TP" if tp > entry else "SL"
+                    pnl     = risk * 2.0 if outcome == "TP" else -risk
+                else:
+                    outcome = "TP" if tp < entry else "SL"
+                    pnl     = risk * 2.0 if outcome == "TP" else -risk
+
+                self.update_trade_outcome(order_id, outcome, pnl)
+                del self.open_positions[order_id]
+
+                tz_ny   = pytz.timezone("America/New_York")
+                now_str = datetime.now(tz_ny).strftime("%d/%m/%Y %H:%M:%S")
+
+                if outcome == "TP":
+                    self.consecutive_wins   += 1
+                    self.consecutive_losses  = 0
+                    send_telegram(
+                        f"✅ <b>[CHẠM TP] {side.upper()} {SYMBOL}</b>\n"
+                        f"🕐 {now_str} (NY)\n"
+                        f"💰 P&L: <b>+${pnl:,.2f}</b>"
+                    )
+                else:
+                    self.consecutive_losses += 1
+                    self.consecutive_wins    = 0
+                    send_telegram(
+                        f"❌ <b>[CHẠM SL] {side.upper()} {SYMBOL}</b>\n"
+                        f"🕐 {now_str} (NY)\n"
+                        f"💸 P&L: <b>-${risk:,.2f}</b>"
+                    )
+
+                # Streak alerts
+                if self.consecutive_wins == 2:
+                    send_telegram(f"🔥 <b>2 THẮNG LIÊN TIẾP!</b> Bot đang vào form — tiếp tục theo dõi.")
+                elif self.consecutive_wins >= 3:
+                    send_telegram(f"🔥🔥 <b>{self.consecutive_wins} THẮNG LIÊN TIẾP!</b> Tuyệt vời!")
+                elif self.consecutive_losses == 2:
+                    send_telegram(f"⚠️ <b>2 THUA LIÊN TIẾP!</b> Cân nhắc gõ /pause để xem lại điều kiện thị trường.")
+                elif self.consecutive_losses >= 3:
+                    send_telegram(
+                        f"🚨 <b>{self.consecutive_losses} THUA LIÊN TIẾP!</b>\n"
+                        f"Bot đã tự tạm dừng để bảo vệ tài khoản.\nGõ /resume để tiếp tục."
+                    )
+                    self.paused = True
 
     def needs_token_refresh(self):
         if self.last_auth_time is None:
@@ -392,7 +719,18 @@ class TradeLockerTokenBot:
     def check_killzone(self):
         tz_ny = pytz.timezone("America/New_York")
         current_time = datetime.now(tz_ny).strftime("%H:%M")
-        return "09:30" <= current_time <= "10:30"
+        in_london  = "03:00" <= current_time <= "04:00"   # London Open Kill Zone
+        in_ny      = "09:30" <= current_time <= "10:30"   # NY Open Kill Zone
+        return in_london or in_ny
+
+    def current_killzone_name(self):
+        tz_ny = pytz.timezone("America/New_York")
+        current_time = datetime.now(tz_ny).strftime("%H:%M")
+        if "03:00" <= current_time <= "04:00":
+            return "London"
+        if "09:30" <= current_time <= "10:30":
+            return "New York"
+        return None
 
     def execute_trade(self, side, entry_price, sl_price):
         if side == "buy":
@@ -427,13 +765,23 @@ class TradeLockerTokenBot:
         try:
             order_res = requests.post(url, json=payload, headers=headers)
             if order_res.status_code == 200:
-                print(f"🚀 [VÀO LỆNH THÀNH CÔNG] {side.upper()} {SYMBOL}! Lot: {final_lot}")
-                self.log_trade(side, entry_price, sl_price, tp_price, final_lot)
+                order_data = order_res.json()
+                order_id   = str(order_data.get("orderId", order_data.get("id", "")))
+                print(f"🚀 [VÀO LỆNH THÀNH CÔNG] {side.upper()} {SYMBOL}! Lot: {final_lot}  ID: {order_id}")
+                self.log_trade(side, entry_price, sl_price, tp_price, final_lot, order_id)
+                # Lưu vào bộ theo dõi lệnh mở
+                if order_id:
+                    self.open_positions[order_id] = {
+                        "side": side, "entry": entry_price,
+                        "sl": sl_price, "tp": tp_price,
+                        "lot": final_lot, "risk_usd": self.risk_usd,
+                    }
                 tz_ny = pytz.timezone("America/New_York")
                 now_str = datetime.now(tz_ny).strftime("%d/%m/%Y %H:%M:%S")
                 emoji = "🟢" if side == "buy" else "🔴"
+                kz = self.current_killzone_name() or ""
                 send_telegram(
-                    f"{emoji} <b>[VÀO LỆNH] {side.upper()} {SYMBOL}</b>\n"
+                    f"{emoji} <b>[VÀO LỆNH] {side.upper()} {SYMBOL}</b>  {kz}\n"
                     f"🕐 {now_str} (NY)\n"
                     f"📌 Entry : <b>{round(entry_price, 2)}</b>\n"
                     f"🛑 Stop Loss : <b>{round(sl_price, 2)}</b>\n"
@@ -478,8 +826,27 @@ class TradeLockerTokenBot:
             print("⏸️  Bot đang tạm dừng. Gõ /resume trên Telegram để tiếp tục.", end="\r")
             return
 
+        # Kiểm tra giới hạn rủi ro ngày
+        today_risk = risk_deployed_today()
+        if today_risk >= self.daily_loss_limit:
+            if not self.paused:
+                self.paused = True
+                send_telegram(
+                    f"🛡️ <b>ĐÃ ĐẠT GIỚI HẠN RỦI RO NGÀY!</b>\n\n"
+                    f"Tổng rủi ro hôm nay: <b>${today_risk:,.2f}</b> / giới hạn <b>${self.daily_loss_limit:,.2f}</b>\n"
+                    f"Bot đã tự tạm dừng để bảo vệ tài khoản.\nGõ /resume để tiếp tục."
+                )
+            return
+
+        # Kiểm tra giới hạn số lệnh ngày
+        trades_today = count_trades_today()
+        if trades_today >= self.max_trades_per_day:
+            print(f"🔢 Đã đạt giới hạn {self.max_trades_per_day} lệnh/ngày. Bot chờ sang ngày mới.", end="\r")
+            return
+
         if not self.check_killzone():
-            print("⏳ Ngoài Kill Zone (9:30–10:30 PM NY). Bot đứng chờ phiên Mỹ để quét SMT...", end="\r")
+            kz_name = self.current_killzone_name()
+            print("⏳ Ngoài Kill Zone (London 3–4AM | NY 9:30–10:30AM). Bot đứng chờ...", end="\r")
             return
 
         nas_candles = self.get_candles(SYMBOL)
@@ -489,9 +856,10 @@ class TradeLockerTokenBot:
 
         if signal:
             entry_price = nas_candles[0]["close"]
-            print(f"\n🔍 [SMT] Kích hoạt tín hiệu {signal.upper()} | Entry: {entry_price:.2f} SL: {sl_price:.2f}")
+            kz = self.current_killzone_name()
+            print(f"\n🔍 [SMT/{kz}] Kích hoạt tín hiệu {signal.upper()} | Entry: {entry_price:.2f} SL: {sl_price:.2f}")
             self.execute_trade(signal, entry_price, sl_price)
-            time.sleep(60)  
+            time.sleep(60)
 
 
 if __name__ == "__main__":
@@ -499,6 +867,33 @@ if __name__ == "__main__":
     if bot.access_token:
         print("\n🤖 Hệ thống Bot ICT Pro Max xác thực Token thành công!")
         print("📡 Bot đang quét sàn NAS100 ngầm và túc trực kèo cho Việt Anh...")
+
+        # Cảnh báo ngay khi khởi động nếu token gần hết hạn
+        days_left = get_refresh_token_days_left()
+        if days_left is not None:
+            print(f"🗓️ Refresh Token còn hiệu lực: {days_left} ngày")
+            if days_left <= 0:
+                send_telegram(
+                    "🚨 <b>REFRESH TOKEN ĐÃ HẾT HẠN!</b>\n\n"
+                    "Bot sẽ không thể xác thực được nữa.\n\n"
+                    "<b>Cách lấy token mới:</b>\n"
+                    "1. Mở Chrome → vào <b>tradelocker.com</b> và đăng nhập\n"
+                    "2. Nhấn <b>F12</b> → chọn tab <b>Application</b>\n"
+                    "3. Bên trái chọn <b>Local Storage</b> → click vào tradelocker.com\n"
+                    "4. Tìm key <b>refresh_token</b> → copy giá trị\n"
+                    "5. Vào Render → <b>Environment</b> → cập nhật <b>REFRESH_TOKEN</b> → Save"
+                )
+            elif days_left <= 3:
+                send_telegram(
+                    f"⚠️ <b>REFRESH TOKEN SẮP HẾT HẠN!</b>\n\n"
+                    f"Còn <b>{days_left} ngày</b> — cần cập nhật sớm!\n\n"
+                    "<b>Cách lấy token mới:</b>\n"
+                    "1. Mở Chrome → vào <b>tradelocker.com</b> và đăng nhập\n"
+                    "2. Nhấn <b>F12</b> → chọn tab <b>Application</b>\n"
+                    "3. Bên trái chọn <b>Local Storage</b> → click vào tradelocker.com\n"
+                    "4. Tìm key <b>refresh_token</b> → copy giá trị\n"
+                    "5. Vào Render → <b>Environment</b> → cập nhật <b>REFRESH_TOKEN</b> → Save"
+                )
 
         listener = threading.Thread(target=poll_telegram_commands, args=(bot,), daemon=True)
         listener.start()
@@ -511,6 +906,8 @@ if __name__ == "__main__":
         except OSError:
             print(f"⚠️ Cổng {port} đang bận — Đã chuyển sang chế độ Dev.")
 
+        last_expiry_check_date  = None
+        last_position_poll_time = 0
         while True:
             try:
                 tz_ny = pytz.timezone("America/New_York")
@@ -524,6 +921,27 @@ if __name__ == "__main__":
                 if now_ny.hour == DAILY_SUMMARY_HOUR and bot.last_summary_date != today_date:
                     bot.last_summary_date = today_date
                     send_daily_summary()
+
+                # Kiểm tra hạn Refresh Token mỗi ngày lúc 9 giờ sáng NY
+                if now_ny.hour == 9 and last_expiry_check_date != today_date:
+                    last_expiry_check_date = today_date
+                    days_left = get_refresh_token_days_left()
+                    if days_left is not None and days_left <= 3:
+                        send_telegram(
+                            f"⚠️ <b>CẢNH BÁO HẠN TOKEN</b>\n\n"
+                            f"Refresh Token còn <b>{days_left} ngày</b>!\n\n"
+                            "<b>Cách lấy token mới:</b>\n"
+                            "1. Mở Chrome → vào <b>tradelocker.com</b> và đăng nhập\n"
+                            "2. Nhấn <b>F12</b> → chọn tab <b>Application</b>\n"
+                            "3. Bên trái chọn <b>Local Storage</b> → click vào tradelocker.com\n"
+                            "4. Tìm key <b>refresh_token</b> → copy giá trị\n"
+                            "5. Vào Render → <b>Environment</b> → cập nhật <b>REFRESH_TOKEN</b> → Save"
+                        )
+
+                # Poll lệnh mở mỗi 30 giây
+                if time.time() - last_position_poll_time >= 30:
+                    bot.poll_open_positions()
+                    last_position_poll_time = time.time()
 
                 bot.run_strategy()
             except Exception as e:
