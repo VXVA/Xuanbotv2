@@ -8,15 +8,14 @@ import requests
 from datetime import datetime, timezone
 import pytz
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv  # Thư viện đọc file cấu hình bảo mật
+from dotenv import load_dotenv
 
-# KÍCH HOẠT TỰ ĐỘNG NẠP CHÌA KHÓA BẢO MẬT
 load_dotenv()
 
 # ============================================================
 # CẤU HÌNH HỆ THỐNG & BIẾN MÔI TRƯỜNG
 # ============================================================
-ACCESS_TOKEN_TTL = 25 * 60  # Làm mới Access Token sau mỗi 25 phút
+ACCESS_TOKEN_TTL = 25 * 60
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
@@ -24,22 +23,30 @@ REFRESH_TOKEN      = os.environ.get("REFRESH_TOKEN")
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "trade_log.csv")
 LOG_HEADERS = ["datetime_ny", "symbol", "side", "lot", "entry_price", "stop_loss", "take_profit", "risk_usd", "order_id", "outcome", "pnl_usd", "close_time"]
-DAILY_SUMMARY_HOUR = 23  # Gửi tóm tắt ngày lúc 11 giờ đêm giờ New York
+DAILY_SUMMARY_HOUR = 23
 
-MAX_TRADES_PER_DAY = 3       # Giới hạn số lệnh tối đa mỗi ngày
-DAILY_LOSS_LIMIT   = 75.0    # Tạm dừng bot nếu tổng rủi ro vượt mức này ($)
+MAX_TRADES_PER_DAY = 3
+DAILY_LOSS_LIMIT   = 75.0
 
-ACCOUNT_ID = "vietanh9a2k5@gmail.com"  # Email đăng nhập của bạn
-SERVER = "BLUEG"                       # Mã server quỹ Blue Guardian
-RISK_USD = 25.0                        # Rủi ro mặc định $25
-SYMBOL = "NAS100"                      # Mã giao dịch chính
-SYMBOL_ES = "SPX500"                   # Mã đối chứng SMT
+ACCOUNT_ID = "vietanh9a2k5@gmail.com"
+SERVER = "BLUEG"
+RISK_USD = 25.0
+SYMBOL = "NAS100"
+SYMBOL_ES = "SPX500"
+
+# ============================================================
+# [FIX D] Point value cho NAS100 — 1 lot = $1/điểm tại hầu hết broker
+# Kiểm tra lại với TradeLocker nếu cần điều chỉnh
+# ============================================================
+NAS100_POINT_VALUE = 1.0   # USD per point per 1 lot
+
+# Buffer SL: 0.03% của giá để tránh bị sweep ngay khi vào lệnh
+SL_BUFFER_PCT = 0.0003
 
 BASE_URL = "https://tradelocker.com/api/v1"
 
 
 def send_telegram(message: str):
-    """Gửi thông báo lệnh tức thì lên Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -54,7 +61,6 @@ def send_telegram(message: str):
 
 
 def get_refresh_token_days_left() -> int | None:
-    """Giải mã JWT để tính số ngày còn lại trước khi Refresh Token hết hạn."""
     try:
         payload_b64 = REFRESH_TOKEN.split(".")[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
@@ -69,7 +75,6 @@ def get_refresh_token_days_left() -> int | None:
 
 
 def send_daily_summary():
-    """Đọc trade_log.csv và gửi tóm tắt kết quả ngày hôm nay lên Telegram"""
     tz_ny = pytz.timezone("America/New_York")
     today_str = datetime.now(tz_ny).strftime("%Y-%m-%d")
     today_label = datetime.now(tz_ny).strftime("%d/%m/%Y")
@@ -140,10 +145,8 @@ def send_daily_summary():
 
 
 def send_weekly_summary():
-    """Gửi tóm tắt tuần lên Telegram"""
     tz_ny = pytz.timezone("America/New_York")
     now_ny = datetime.now(tz_ny)
-    week_start = now_ny.strftime("%d/%m")
 
     trades = []
     if os.path.isfile(LOG_FILE):
@@ -189,7 +192,6 @@ def send_weekly_summary():
 
 
 def count_trades_today():
-    """Đếm số lệnh đã vào hôm nay từ trade_log.csv"""
     if not os.path.isfile(LOG_FILE):
         return 0
     tz_ny = pytz.timezone("America/New_York")
@@ -207,7 +209,6 @@ def count_trades_today():
 
 
 def risk_deployed_today():
-    """Tính tổng rủi ro đã triển khai hôm nay ($)"""
     if not os.path.isfile(LOG_FILE):
         return 0.0
     tz_ny = pytz.timezone("America/New_York")
@@ -228,7 +229,6 @@ def risk_deployed_today():
 
 
 def poll_telegram_commands(bot_ref):
-    """Lắng nghe lệnh điều khiển từ Telegram trong luồng riêng"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     last_update_id = None
@@ -276,13 +276,17 @@ def poll_telegram_commands(bot_ref):
                     zone_status = (
                         "🟢 <b>ĐANG TRONG KILL ZONE</b> — Bot đang rình kèo!"
                         if in_killzone else
-                        "🔵 Ngoài Kill Zone — Bot đang túc trực chờ phiên Mỹ (21:30–22:30 NY)."
+                        "🔵 Ngoài Kill Zone — Bot đang túc trực chờ phiên Mỹ (09:30–10:30 NY)."
                     )
                     trade_status = (
                         "⏸️ <b>ĐÃ TẠM DỪNG</b> — Gõ /resume để tiếp tục."
                         if bot_ref.paused else
                         "▶️ <b>ĐANG CHẠY</b> — Gõ /pause để tạm dừng."
                     )
+
+                    # [FIX B] Hiển thị cooldown status theo kill zone
+                    kz_traded = ", ".join(bot_ref.traded_killzones_today) if bot_ref.traded_killzones_today else "Chưa có"
+                    cooldown_line = f"🕐 Kill zone đã vào lệnh hôm nay: <b>{kz_traded}</b>"
 
                     send_telegram(
                         f"📡 <b>TRẠNG THÁI BOT ICT PRO MAX</b>\n"
@@ -291,6 +295,7 @@ def poll_telegram_commands(bot_ref):
                         f"{zone_status}\n\n"
                         f"{token_line}\n"
                         f"📊 Lệnh hôm nay: <b>{trades_today}/{bot_ref.max_trades_per_day}</b>\n"
+                        f"{cooldown_line}\n"
                         f"🛡️ Rủi ro hôm nay: <b>${risk_deployed_today():,.2f}</b> / giới hạn <b>${bot_ref.daily_loss_limit:,.2f}</b>\n"
                         f"💎 Symbol: <b>{SYMBOL}</b>  |  Risk/lệnh: <b>${bot_ref.risk_usd}</b>"
                     )
@@ -498,30 +503,43 @@ class _Health(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-        
+
     def log_message(self, format, *args):
-        """Ghi đè chuẩn để tắt hoàn toàn log nhật ký mạng HTTP, tránh lỗi type hint"""
         pass
 
 
 class TradeLockerTokenBot:
     def __init__(self):
-        self.access_token       = None
-        self.acc_id             = None
-        self.last_auth_time     = None
-        self.last_summary_date  = None
-        self.paused             = False
-        self.risk_usd           = RISK_USD
-        self.daily_loss_limit   = DAILY_LOSS_LIMIT
-        self.max_trades_per_day = MAX_TRADES_PER_DAY
-        self.open_positions     = {}   # order_id -> {side, entry, sl, tp, lot, risk_usd, row_datetime}
-        self.consecutive_wins   = 0
-        self.consecutive_losses = 0
+        self.access_token           = None
+        self.acc_id                 = None
+        self.last_auth_time         = None
+        self.last_summary_date      = None
+        self.paused                 = False
+        self.risk_usd               = RISK_USD
+        self.daily_loss_limit       = DAILY_LOSS_LIMIT
+        self.max_trades_per_day     = MAX_TRADES_PER_DAY
+        self.open_positions         = {}
+        self.consecutive_wins       = 0
+        self.consecutive_losses     = 0
+
+        # [FIX B] Cooldown per kill zone: lưu tập hợp kill zone đã vào lệnh hôm nay
+        # Reset mỗi ngày NY trong run loop chính
+        self.traded_killzones_today = set()   # {"London", "NewYork"}
+        self._last_kz_reset_date    = None
+
         self.authenticate_with_token()
+
+    def _reset_killzone_cooldown_if_new_day(self):
+        """Reset danh sách kill zone đã vào lệnh khi sang ngày mới (giờ NY)"""
+        tz_ny = pytz.timezone("America/New_York")
+        today_str = datetime.now(tz_ny).strftime("%Y-%m-%d")
+        if self._last_kz_reset_date != today_str:
+            self.traded_killzones_today = set()
+            self._last_kz_reset_date = today_str
 
     def authenticate_with_token(self):
         url = "https://auth.tradelocker.com/realms/tradelocker/protocol/openid-connect/token"
-        
+
         if not REFRESH_TOKEN:
             print("❌ Không tìm thấy mã REFRESH_TOKEN trong hệ thống.")
             return
@@ -584,7 +602,6 @@ class TradeLockerTokenBot:
         print(f"   ➔ Đã lưu lệnh vào nhật ký: trade_log.csv")
 
     def get_open_positions(self):
-        """Lấy danh sách lệnh đang mở từ sàn"""
         if not self.acc_id or not self.access_token:
             return []
         url = f"{BASE_URL}/trade/positions?accId={self.acc_id}"
@@ -598,7 +615,6 @@ class TradeLockerTokenBot:
         return []
 
     def update_trade_outcome(self, order_id: str, outcome: str, pnl_usd: float):
-        """Cập nhật kết quả lệnh (TP/SL) vào trade_log.csv"""
         if not os.path.isfile(LOG_FILE):
             return
         tz_ny = pytz.timezone("America/New_York")
@@ -622,7 +638,6 @@ class TradeLockerTokenBot:
             print(f"   ➔ Cập nhật kết quả lệnh {order_id}: {outcome}  P&L=${pnl_usd:+.2f}")
 
     def poll_open_positions(self):
-        """Kiểm tra lệnh đang mở — phát hiện khi TP/SL bị chạm"""
         if not self.open_positions:
             return
         live_positions = self.get_open_positions()
@@ -630,14 +645,12 @@ class TradeLockerTokenBot:
 
         for order_id, pos in list(self.open_positions.items()):
             if str(order_id) not in live_ids:
-                # Lệnh đã đóng — xác định TP hay SL
                 entry  = pos["entry"]
                 sl     = pos["sl"]
                 tp     = pos["tp"]
                 side   = pos["side"]
                 risk   = pos["risk_usd"]
 
-                # Tính P&L ước tính dựa trên TP/SL ratio 1:2
                 if side == "buy":
                     outcome = "TP" if tp > entry else "SL"
                     pnl     = risk * 2.0 if outcome == "TP" else -risk
@@ -668,7 +681,6 @@ class TradeLockerTokenBot:
                         f"💸 P&L: <b>-${risk:,.2f}</b>"
                     )
 
-                # Streak alerts
                 if self.consecutive_wins == 2:
                     send_telegram(f"🔥 <b>2 THẮNG LIÊN TIẾP!</b> Bot đang vào form — tiếp tục theo dõi.")
                 elif self.consecutive_wins >= 3:
@@ -705,8 +717,9 @@ class TradeLockerTokenBot:
         except Exception as e:
             print(f"❌ Lỗi xử lý dữ liệu tài khoản sau đăng nhập: {e}")
 
-    def get_candles(self, symbol):
-        url = f"{BASE_URL}/market/candles?symbol={symbol}&resolution=1m&count=50"
+    def get_candles(self, symbol, resolution="1m", count=50):
+        """Lấy nến từ sàn với resolution tuỳ chọn"""
+        url = f"{BASE_URL}/market/candles?symbol={symbol}&resolution={resolution}&count={count}"
         headers = {"Authorization": f"Bearer {self.access_token}"}
         try:
             res = requests.get(url, headers=headers)
@@ -719,8 +732,8 @@ class TradeLockerTokenBot:
     def check_killzone(self):
         tz_ny = pytz.timezone("America/New_York")
         current_time = datetime.now(tz_ny).strftime("%H:%M")
-        in_london  = "03:00" <= current_time <= "04:00"   # London Open Kill Zone
-        in_ny      = "09:30" <= current_time <= "10:30"   # NY Open Kill Zone
+        in_london = "03:00" <= current_time <= "04:00"
+        in_ny     = "09:30" <= current_time <= "10:30"
         return in_london or in_ny
 
     def current_killzone_name(self):
@@ -729,21 +742,64 @@ class TradeLockerTokenBot:
         if "03:00" <= current_time <= "04:00":
             return "London"
         if "09:30" <= current_time <= "10:30":
-            return "New York"
+            return "NewYork"
+        return None
+
+    # ──────────────────────────────────────────────────────────
+    # [FIX C] HTF BIAS FILTER — xác nhận xu hướng 15 phút
+    # Chỉ cho phép BUY nếu 15m trend đang tăng (EMA20 > EMA50)
+    # Chỉ cho phép SELL nếu 15m trend đang giảm (EMA20 < EMA50)
+    # ──────────────────────────────────────────────────────────
+    def _ema(self, values: list[float], period: int) -> float:
+        """Tính EMA đơn giản từ danh sách giá (cũ → mới)"""
+        if len(values) < period:
+            return sum(values) / len(values)
+        k = 2 / (period + 1)
+        ema = sum(values[:period]) / period
+        for v in values[period:]:
+            ema = v * k + ema * (1 - k)
+        return ema
+
+    def get_htf_bias(self) -> str | None:
+        """
+        Lấy xu hướng 15 phút của NAS100 bằng EMA20 vs EMA50.
+        Trả về "bull", "bear", hoặc None nếu không đủ dữ liệu.
+        """
+        candles_15m = self.get_candles(SYMBOL, resolution="15m", count=60)
+        if not candles_15m or len(candles_15m) < 50:
+            print("⚠️ Không đủ nến 15m để tính HTF bias — bỏ qua filter.")
+            return None  # Không đủ data thì không chặn tín hiệu
+
+        # API trả nến theo thứ tự mới → cũ, cần đảo ngược để EMA tính đúng
+        closes = [c["close"] for c in reversed(candles_15m)]
+
+        ema20 = self._ema(closes, 20)
+        ema50 = self._ema(closes, 50)
+
+        if ema20 > ema50:
+            return "bull"
+        elif ema20 < ema50:
+            return "bear"
         return None
 
     def execute_trade(self, side, entry_price, sl_price):
         if side == "buy":
             distance = entry_price - sl_price
-            tp_price = entry_price + (distance * 2.0)  
-        else:  
+            tp_price = entry_price + (distance * 2.0)
+        else:
             distance = sl_price - entry_price
-            tp_price = entry_price - (distance * 2.0)  
+            tp_price = entry_price - (distance * 2.0)
 
         if distance <= 0:
             return
 
-        calculated_lot = self.risk_usd / distance
+        # ──────────────────────────────────────────────────────
+        # [FIX D] Công thức lot đúng cho NAS100
+        # risk_usd = lot × distance × point_value
+        # → lot = risk_usd / (distance × point_value)
+        # ──────────────────────────────────────────────────────
+        calculated_lot = self.risk_usd / (distance * NAS100_POINT_VALUE)
+
         if calculated_lot < 0.05:
             print(f"⚠️ Bỏ qua tín hiệu: Khoảng cách vùng nến quá rộng (Lot {calculated_lot:.2f} < 0.05).")
             return
@@ -753,12 +809,12 @@ class TradeLockerTokenBot:
         url = f"{BASE_URL}/trade/order"
         headers = {"Authorization": f"Bearer {self.access_token}"}
         payload = {
-            "accId": self.acc_id,
-            "symbol": SYMBOL,
-            "side": side,
-            "type": "market",
-            "quantity": final_lot,
-            "stopLoss": round(sl_price, 2),
+            "accId":      self.acc_id,
+            "symbol":     SYMBOL,
+            "side":       side,
+            "type":       "market",
+            "quantity":   final_lot,
+            "stopLoss":   round(sl_price, 2),
             "takeProfit": round(tp_price, 2),
         }
 
@@ -769,7 +825,6 @@ class TradeLockerTokenBot:
                 order_id   = str(order_data.get("orderId", order_data.get("id", "")))
                 print(f"🚀 [VÀO LỆNH THÀNH CÔNG] {side.upper()} {SYMBOL}! Lot: {final_lot}  ID: {order_id}")
                 self.log_trade(side, entry_price, sl_price, tp_price, final_lot, order_id)
-                # Lưu vào bộ theo dõi lệnh mở
                 if order_id:
                     self.open_positions[order_id] = {
                         "side": side, "entry": entry_price,
@@ -795,33 +850,60 @@ class TradeLockerTokenBot:
             print(f"❌ Lỗi phát lệnh lên sàn: {e}")
 
     def check_smt_divergence(self, nas_candles, es_candles):
-        """THUẬT TOÁN ICT: LIQUIDITY SWEPT + SMT DIVERGENCE XÁC NHẬN (BẢN UPDATE TẦM NHÌN 30 PHÚT)"""
+        """
+        THUẬT TOÁN ICT: LIQUIDITY SWEPT + SMT DIVERGENCE
+
+        Cải tiến so với phiên bản cũ:
+        - [FIX A] SL có buffer 0.03% để tránh bị sweep ngay lập tức
+        - MSS confirmation: close phải vượt swing high/low 5 nến trước,
+          không chỉ nến liền kề (tránh engulf giả)
+        - HTF bias filter được xử lý bên ngoài tại run_strategy()
+        """
         if not nas_candles or not es_candles or len(nas_candles) < 35 or len(es_candles) < 35:
             return None, None
 
         nas_curr = nas_candles[0]
         es_curr  = es_candles[0]
 
+        # Swing trong 30 nến trước (index 1..30)
         nas_prev_low  = min(c["low"]  for c in nas_candles[1:31])
         nas_prev_high = max(c["high"] for c in nas_candles[1:31])
         es_prev_low   = min(c["low"]  for c in es_candles[1:31])
         es_prev_high  = max(c["high"] for c in es_candles[1:31])
 
-        # ── BUY SETUP (NAS quét đáy sâu trong 30p qua + ES giữ đáy + Nến đóng cửa MSS)
-        if (nas_curr["low"] < nas_prev_low 
-                and es_curr["low"] >= es_prev_low 
-                and nas_curr["close"] > nas_candles[1]["high"]):
-            return "buy", nas_curr["low"]
+        # [FIX C] MSS confirmation: close phải vượt swing high/low của 5 nến trước
+        # (thay vì chỉ nến [1] — quá yếu, dễ bị engulf giả trigger)
+        mss_swing_high = max(c["high"] for c in nas_candles[1:6])  # swing 5 nến
+        mss_swing_low  = min(c["low"]  for c in nas_candles[1:6])
 
-        # ── SELL SETUP (NAS quét đỉnh cao trong 30p qua + ES giữ đỉnh + Nến đóng cửa MSS)
-        if (nas_curr["high"] > nas_prev_high 
-                and es_curr["high"] <= es_prev_high 
-                and nas_curr["close"] < nas_candles[1]["low"]):
-            return "sell", nas_curr["high"]
+        # ── BUY SETUP ──
+        # NAS quét đáy 30 nến + ES giữ đáy + MSS: close trên swing high 5 nến
+        if (nas_curr["low"] < nas_prev_low
+                and es_curr["low"] >= es_prev_low
+                and nas_curr["close"] > mss_swing_high):
+
+            # [FIX A] SL đặt dưới đáy nến sweep thêm buffer 0.03%
+            buffer   = nas_curr["low"] * SL_BUFFER_PCT
+            sl_price = nas_curr["low"] - buffer
+            return "buy", round(sl_price, 2)
+
+        # ── SELL SETUP ──
+        # NAS quét đỉnh 30 nến + ES giữ đỉnh + MSS: close dưới swing low 5 nến
+        if (nas_curr["high"] > nas_prev_high
+                and es_curr["high"] <= es_prev_high
+                and nas_curr["close"] < mss_swing_low):
+
+            # [FIX A] SL đặt trên đỉnh nến sweep thêm buffer 0.03%
+            buffer   = nas_curr["high"] * SL_BUFFER_PCT
+            sl_price = nas_curr["high"] + buffer
+            return "sell", round(sl_price, 2)
 
         return None, None
 
     def run_strategy(self):
+        # Reset cooldown kill zone nếu sang ngày mới
+        self._reset_killzone_cooldown_if_new_day()
+
         if self.paused:
             print("⏸️  Bot đang tạm dừng. Gõ /resume trên Telegram để tiếp tục.", end="\r")
             return
@@ -845,8 +927,19 @@ class TradeLockerTokenBot:
             return
 
         if not self.check_killzone():
-            kz_name = self.current_killzone_name()
             print("⏳ Ngoài Kill Zone (London 3–4AM | NY 9:30–10:30AM). Bot đứng chờ...", end="\r")
+            return
+
+        kz = self.current_killzone_name()
+
+        # ──────────────────────────────────────────────────────
+        # [FIX B] Cooldown per kill zone
+        # Mỗi kill zone chỉ cho vào TỐI ĐA 1 lệnh/ngày
+        # Sau khi đã vào lệnh trong London thì bỏ qua toàn bộ
+        # London còn lại; tương tự cho NewYork
+        # ──────────────────────────────────────────────────────
+        if kz and kz in self.traded_killzones_today:
+            print(f"🔒 Đã vào lệnh trong kill zone {kz} hôm nay — chờ kill zone tiếp theo.", end="\r")
             return
 
         nas_candles = self.get_candles(SYMBOL)
@@ -855,10 +948,27 @@ class TradeLockerTokenBot:
         signal, sl_price = self.check_smt_divergence(nas_candles, es_candles)
 
         if signal:
+            # ──────────────────────────────────────────────────
+            # [FIX C] HTF Bias Filter
+            # Chỉ vào lệnh nếu 15m trend đồng hướng với signal
+            # ──────────────────────────────────────────────────
+            htf_bias = self.get_htf_bias()
+            if htf_bias is not None:
+                if signal == "buy" and htf_bias != "bull":
+                    print(f"🚫 [HTF FILTER] Tín hiệu BUY bị chặn — 15m trend đang GIẢM (bearish bias).", end="\r")
+                    return
+                if signal == "sell" and htf_bias != "bear":
+                    print(f"🚫 [HTF FILTER] Tín hiệu SELL bị chặn — 15m trend đang TĂNG (bullish bias).", end="\r")
+                    return
+
             entry_price = nas_candles[0]["close"]
-            kz = self.current_killzone_name()
-            print(f"\n🔍 [SMT/{kz}] Kích hoạt tín hiệu {signal.upper()} | Entry: {entry_price:.2f} SL: {sl_price:.2f}")
+            print(f"\n🔍 [SMT/{kz}] Kích hoạt tín hiệu {signal.upper()} | Entry: {entry_price:.2f}  SL: {sl_price:.2f}  HTF: {htf_bias or 'N/A'}")
             self.execute_trade(signal, entry_price, sl_price)
+
+            # [FIX B] Đánh dấu kill zone này đã có lệnh
+            if kz:
+                self.traded_killzones_today.add(kz)
+
             time.sleep(60)
 
 
@@ -868,7 +978,6 @@ if __name__ == "__main__":
         print("\n🤖 Hệ thống Bot ICT Pro Max xác thực Token thành công!")
         print("📡 Bot đang quét sàn NAS100 ngầm và túc trực kèo cho Việt Anh...")
 
-        # Cảnh báo ngay khi khởi động nếu token gần hết hạn
         days_left = get_refresh_token_days_left()
         if days_left is not None:
             print(f"🗓️ Refresh Token còn hiệu lực: {days_left} ngày")
@@ -922,7 +1031,6 @@ if __name__ == "__main__":
                     bot.last_summary_date = today_date
                     send_daily_summary()
 
-                # Kiểm tra hạn Refresh Token mỗi ngày lúc 9 giờ sáng NY
                 if now_ny.hour == 9 and last_expiry_check_date != today_date:
                     last_expiry_check_date = today_date
                     days_left = get_refresh_token_days_left()
@@ -938,7 +1046,6 @@ if __name__ == "__main__":
                             "5. Vào Render → <b>Environment</b> → cập nhật <b>REFRESH_TOKEN</b> → Save"
                         )
 
-                # Poll lệnh mở mỗi 30 giây
                 if time.time() - last_position_poll_time >= 30:
                     bot.poll_open_positions()
                     last_position_poll_time = time.time()
