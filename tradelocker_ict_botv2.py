@@ -43,7 +43,69 @@ NAS100_POINT_VALUE = 1.0   # USD per point per 1 lot
 # Buffer SL: 0.03% của giá để tránh bị sweep ngay khi vào lệnh
 SL_BUFFER_PCT = 0.0003
 
-BASE_URL = "https://tradelocker.com/api/v1"
+# ============================================================
+# BASE URL — tự động chọn demo/live theo biến môi trường
+# Set TRADELOCKER_ENV=live trong Render để dùng live account
+# Mặc định là demo (an toàn hơn)
+# ============================================================
+_TL_ENV = os.environ.get("TRADELOCKER_ENV", "demo").strip().lower()
+if _TL_ENV == "live":
+    BASE_URL = "https://live.tradelocker.com/backend-api"
+else:
+    BASE_URL = "https://demo.tradelocker.com/backend-api"
+
+# Giới hạn page size cho ordersHistory — được cập nhật từ /trade/config khi khởi động
+ORDERS_HISTORY_PAGE_SIZE = 50   # default an toàn trước khi fetch config
+
+# ============================================================
+# [NEW 1] SESSION FILTER — Ngày lễ Mỹ + thứ Sáu NFP
+# NFP = thứ Sáu đầu tiên mỗi tháng
+# ============================================================
+US_HOLIDAYS_2025 = {
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18",
+    "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01",
+    "2025-11-27", "2025-12-25",
+}
+US_HOLIDAYS_2026 = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+}
+US_HOLIDAYS = US_HOLIDAYS_2025 | US_HOLIDAYS_2026
+
+
+def is_nfp_friday() -> bool:
+    """Trả về True nếu hôm nay là thứ Sáu NFP (thứ Sáu đầu tiên của tháng, giờ NY)."""
+    tz_ny = pytz.timezone("America/New_York")
+    now_ny = datetime.now(tz_ny)
+    if now_ny.weekday() != 4:   # 4 = Friday
+        return False
+    # Thứ Sáu đầu tiên của tháng khi ngày <= 7
+    return now_ny.day <= 7
+
+
+def is_trading_allowed() -> tuple[bool, str]:
+    """
+    Kiểm tra xem hôm nay có được phép trade không.
+    Trả về (allowed: bool, reason: str).
+    """
+    tz_ny = pytz.timezone("America/New_York")
+    now_ny = datetime.now(tz_ny)
+    today_str = now_ny.strftime("%Y-%m-%d")
+
+    # Cuối tuần
+    if now_ny.weekday() >= 5:
+        return False, "Cuối tuần — thị trường đóng cửa."
+
+    # Ngày lễ Mỹ
+    if today_str in US_HOLIDAYS:
+        return False, f"Ngày lễ Mỹ ({today_str}) — thị trường đóng cửa."
+
+    # Thứ Sáu NFP
+    if is_nfp_friday():
+        return False, "Thứ Sáu NFP — biến động bất thường, bot tự bỏ qua phiên."
+
+    return True, ""
 
 
 def send_telegram(message: str):
@@ -602,6 +664,7 @@ class TradeLockerTokenBot:
         print(f"   ➔ Đã lưu lệnh vào nhật ký: trade_log.csv")
 
     def get_open_positions(self):
+        """GET /trade/positions — lấy vị thế đang mở"""
         if not self.acc_id or not self.access_token:
             return []
         url = f"{BASE_URL}/trade/positions?accId={self.acc_id}"
@@ -610,6 +673,7 @@ class TradeLockerTokenBot:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
                 return res.json().get("positions", [])
+            print(f"⚠️ /trade/positions HTTP {res.status_code}")
         except Exception as e:
             print(f"⚠️ Lỗi lấy vị thế mở: {e}")
         return []
@@ -637,6 +701,94 @@ class TradeLockerTokenBot:
                 writer.writerows(rows)
             print(f"   ➔ Cập nhật kết quả lệnh {order_id}: {outcome}  P&L=${pnl_usd:+.2f}")
 
+    def get_closed_positions(self) -> list:
+        """
+        GET /trade/ordersHistory — lấy lịch sử lệnh đã đóng để tracking P&L thực tế.
+        Dùng page size từ /trade/config (ORDERS_HISTORY_PAGE_SIZE).
+        Response: {"ordersHistory": [...]} hoặc {"d": {"ordersHistory": [...]}}
+        """
+        if not self.acc_id or not self.access_token:
+            return []
+        url = f"{BASE_URL}/trade/ordersHistory?accId={self.acc_id}&limit={ORDERS_HISTORY_PAGE_SIZE}"
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                # TradeLocker có thể wrap trong "d" hoặc trả trực tiếp
+                if "d" in data and "ordersHistory" in data["d"]:
+                    return data["d"]["ordersHistory"]
+                if "ordersHistory" in data:
+                    return data["ordersHistory"]
+                # Fallback: thử filledOrders nếu ordersHistory trống
+                if "filledOrders" in data:
+                    return data["filledOrders"]
+            else:
+                print(f"⚠️ /trade/ordersHistory HTTP {res.status_code}: {res.text[:150]}")
+        except Exception as e:
+            print(f"⚠️ Lỗi fetch ordersHistory: {e}")
+        return []
+
+    def _resolve_closed_pnl(self, order_id: str, pos: dict) -> tuple[str, float]:
+        """
+        Xác định outcome + P&L thực tế từ /trade/ordersHistory.
+
+        TradeLocker ordersHistory fields (theo tài liệu public):
+          id / orderId   — ID lệnh
+          profit         — P&L thực tế (số âm = lỗ)
+          side           — "buy" / "sell"
+          filledPrice    — giá khớp thực
+          status         — "Filled" / "Cancelled" v.v.
+
+        Fallback về ước tính nếu không match được record.
+        """
+        closed = self.get_closed_positions()
+        for record in closed:
+            rec_id = str(
+                record.get("id",
+                record.get("orderId",
+                record.get("positionId", "")))
+            )
+            if rec_id != str(order_id):
+                continue
+
+            # Bỏ qua lệnh bị huỷ
+            status = str(record.get("status", "")).lower()
+            if status in ("cancelled", "rejected", "expired"):
+                break
+
+            # P&L thực từ sàn
+            real_pnl = record.get("profit")
+            if real_pnl is not None:
+                pnl_val = float(real_pnl)
+                outcome = "TP" if pnl_val >= 0 else "SL"
+                print(f"   ✅ P&L thực từ ordersHistory: {outcome}  ${pnl_val:+.2f}")
+                return outcome, round(pnl_val, 2)
+
+            # Nếu không có profit field, tính từ filledPrice
+            filled_price = record.get("filledPrice", record.get("closePrice"))
+            if filled_price is not None:
+                entry = pos["entry"]
+                lot   = pos["lot"]
+                cp    = float(filled_price)
+                if pos["side"] == "buy":
+                    pnl_val = (cp - entry) * lot * NAS100_POINT_VALUE
+                else:
+                    pnl_val = (entry - cp) * lot * NAS100_POINT_VALUE
+                outcome = "TP" if pnl_val >= 0 else "SL"
+                print(f"   ✅ P&L tính từ filledPrice: {outcome}  ${pnl_val:+.2f}")
+                return outcome, round(pnl_val, 2)
+
+        # Fallback ước tính — giữ nguyên hành vi cũ
+        entry = pos["entry"]
+        side  = pos["side"]
+        risk  = pos["risk_usd"]
+        tp    = pos["tp"]
+        outcome = ("TP" if tp > entry else "SL") if side == "buy" else ("TP" if tp < entry else "SL")
+        pnl = risk * 2.0 if outcome == "TP" else -risk
+        print(f"   ⚠️ Không tìm thấy record lệnh {order_id} trong ordersHistory — dùng ước tính.")
+        return outcome, round(pnl, 2)
+
     def poll_open_positions(self):
         if not self.open_positions:
             return
@@ -645,18 +797,11 @@ class TradeLockerTokenBot:
 
         for order_id, pos in list(self.open_positions.items()):
             if str(order_id) not in live_ids:
-                entry  = pos["entry"]
-                sl     = pos["sl"]
-                tp     = pos["tp"]
-                side   = pos["side"]
-                risk   = pos["risk_usd"]
+                side = pos["side"]
+                risk = pos["risk_usd"]
 
-                if side == "buy":
-                    outcome = "TP" if tp > entry else "SL"
-                    pnl     = risk * 2.0 if outcome == "TP" else -risk
-                else:
-                    outcome = "TP" if tp < entry else "SL"
-                    pnl     = risk * 2.0 if outcome == "TP" else -risk
+                # [NEW 2] Lấy P&L thực từ sàn thay vì ước tính cố định
+                outcome, pnl = self._resolve_closed_pnl(order_id, pos)
 
                 self.update_trade_outcome(order_id, outcome, pnl)
                 del self.open_positions[order_id]
@@ -670,7 +815,7 @@ class TradeLockerTokenBot:
                     send_telegram(
                         f"✅ <b>[CHẠM TP] {side.upper()} {SYMBOL}</b>\n"
                         f"🕐 {now_str} (NY)\n"
-                        f"💰 P&L: <b>+${pnl:,.2f}</b>"
+                        f"💰 P&L thực tế: <b>+${pnl:,.2f}</b>"
                     )
                 else:
                     self.consecutive_losses += 1
@@ -678,7 +823,7 @@ class TradeLockerTokenBot:
                     send_telegram(
                         f"❌ <b>[CHẠM SL] {side.upper()} {SYMBOL}</b>\n"
                         f"🕐 {now_str} (NY)\n"
-                        f"💸 P&L: <b>-${risk:,.2f}</b>"
+                        f"💸 P&L thực tế: <b>${pnl:,.2f}</b>"
                     )
 
                 if self.consecutive_wins == 2:
@@ -700,33 +845,86 @@ class TradeLockerTokenBot:
         return (time.time() - self.last_auth_time) >= ACCESS_TOKEN_TTL
 
     def get_account_details(self):
+        """
+        Lấy danh sách tài khoản và fetch /trade/config để cập nhật page size.
+        Endpoint: GET /auth/accounts (TradeLocker backend-api)
+        """
         url = f"{BASE_URL}/auth/accounts"
-        headers = {"Authorization": f"Bearer {self.access_token}"}
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
         try:
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
                 accounts = res.json().get("accounts", [])
                 for acc in accounts:
                     if acc.get("accNum") == ACCOUNT_ID or SERVER in acc.get("name", ""):
                         self.acc_id = acc.get("id")
-                        print(f"🔒 Kết nối thành công tài khoản Quỹ Demo {SERVER}! ID hệ thống: {self.acc_id}")
+                        print(f"🔒 Kết nối thành công tài khoản Quỹ Demo {SERVER}! ID: {self.acc_id}")
+                        self._fetch_trade_config()
                         return
                 if accounts:
                     self.acc_id = accounts[0].get("id")
-                    print(f"🔒 Kết nối thành công tài khoản mặc định có sẵn đầu tiên! ID: {self.acc_id}")
+                    print(f"🔒 Kết nối tài khoản mặc định đầu tiên! ID: {self.acc_id}")
+                    self._fetch_trade_config()
+            else:
+                print(f"⚠️ get_account_details HTTP {res.status_code}: {res.text[:200]}")
         except Exception as e:
-            print(f"❌ Lỗi xử lý dữ liệu tài khoản sau đăng nhập: {e}")
+            print(f"❌ Lỗi xử lý dữ liệu tài khoản: {e}")
 
-    def get_candles(self, symbol, resolution="1m", count=50):
-        """Lấy nến từ sàn với resolution tuỳ chọn"""
-        url = f"{BASE_URL}/market/candles?symbol={symbol}&resolution={resolution}&count={count}"
+    def _fetch_trade_config(self):
+        """
+        Fetch /trade/config để lấy giới hạn page size thực tế cho ordersHistory.
+        Cập nhật biến module ORDERS_HISTORY_PAGE_SIZE.
+        """
+        global ORDERS_HISTORY_PAGE_SIZE
+        if not self.acc_id or not self.access_token:
+            return
+        url = f"{BASE_URL}/trade/config?accId={self.acc_id}"
         headers = {"Authorization": f"Bearer {self.access_token}"}
         try:
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                return res.json().get("candles", [])
-        except:
-            return []
+                cfg = res.json()
+                # TradeLocker thường trả {"config": {"ordersHistory": {"maxCount": N}, ...}}
+                # hoặc {"ordersHistoryMaxCount": N} — thử cả hai cấu trúc
+                max_count = (
+                    cfg.get("config", {}).get("ordersHistory", {}).get("maxCount")
+                    or cfg.get("ordersHistoryMaxCount")
+                    or cfg.get("maxOrdersHistory")
+                    or cfg.get("historyLimit")
+                )
+                if max_count:
+                    ORDERS_HISTORY_PAGE_SIZE = int(max_count)
+                    print(f"📋 /trade/config: ordersHistory page size = {ORDERS_HISTORY_PAGE_SIZE}")
+                else:
+                    print(f"📋 /trade/config: không tìm thấy maxCount — giữ default {ORDERS_HISTORY_PAGE_SIZE}")
+            else:
+                print(f"⚠️ /trade/config HTTP {res.status_code} — giữ default page size {ORDERS_HISTORY_PAGE_SIZE}")
+        except Exception as e:
+            print(f"⚠️ Lỗi fetch /trade/config: {e}")
+
+    def get_candles(self, symbol, resolution="1", count=50):
+        """
+        GET /trade/instruments/{instrument}/candles
+        TradeLocker dùng resolution là số (1=1m, 5=5m, 15=15m, 60=1h, D=daily).
+        Thử endpoint v2 trước, fallback về v1-style nếu cần.
+        """
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        # Endpoint chính của TradeLocker backend-api
+        url = f"{BASE_URL}/trade/candles?accId={self.acc_id}&symbol={symbol}&resolution={resolution}&count={count}"
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                # TradeLocker trả {"candles": [...]} hoặc {"d": {"candles": [...]}}
+                if "d" in data and "candles" in data["d"]:
+                    return data["d"]["candles"]
+                return data.get("candles", [])
+            print(f"⚠️ /trade/candles HTTP {res.status_code} — {symbol} {resolution}m")
+        except Exception as e:
+            print(f"⚠️ Lỗi get_candles: {e}")
         return []
 
     def check_killzone(self):
@@ -746,12 +944,12 @@ class TradeLockerTokenBot:
         return None
 
     # ──────────────────────────────────────────────────────────
-    # [FIX C] HTF BIAS FILTER — xác nhận xu hướng 15 phút
-    # Chỉ cho phép BUY nếu 15m trend đang tăng (EMA20 > EMA50)
-    # Chỉ cho phép SELL nếu 15m trend đang giảm (EMA20 < EMA50)
+    # [NEW 3] HTF BIAS — ICT Swing Structure (thay thế EMA)
+    # Dùng Higher High / Higher Low / Lower High / Lower Low
+    # trên khung 15m để xác định bias thực sự theo ICT
     # ──────────────────────────────────────────────────────────
     def _ema(self, values: list[float], period: int) -> float:
-        """Tính EMA đơn giản từ danh sách giá (cũ → mới)"""
+        """Tính EMA đơn giản (giữ lại cho trường hợp cần dùng sau)"""
         if len(values) < period:
             return sum(values) / len(values)
         k = 2 / (period + 1)
@@ -760,22 +958,73 @@ class TradeLockerTokenBot:
             ema = v * k + ema * (1 - k)
         return ema
 
+    def _find_swing_points(self, candles: list, lookback: int = 3) -> list[dict]:
+        """
+        Tìm swing high/low từ danh sách nến (cũ → mới).
+        Một điểm là swing high nếu high của nó cao hơn `lookback` nến hai bên.
+        Tương tự swing low.
+        Trả về list dict: {"type": "high"/"low", "price": float, "idx": int}
+        """
+        swings = []
+        n = len(candles)
+        for i in range(lookback, n - lookback):
+            c = candles[i]
+            # Swing High
+            if all(c["high"] > candles[i - j]["high"] for j in range(1, lookback + 1)) and \
+               all(c["high"] > candles[i + j]["high"] for j in range(1, lookback + 1)):
+                swings.append({"type": "high", "price": c["high"], "idx": i})
+            # Swing Low
+            if all(c["low"] < candles[i - j]["low"] for j in range(1, lookback + 1)) and \
+               all(c["low"] < candles[i + j]["low"] for j in range(1, lookback + 1)):
+                swings.append({"type": "low", "price": c["low"], "idx": i})
+        return swings
+
     def get_htf_bias(self) -> str | None:
         """
-        Lấy xu hướng 15 phút của NAS100 bằng EMA20 vs EMA50.
-        Trả về "bull", "bear", hoặc None nếu không đủ dữ liệu.
+        [NEW 3] HTF Bias theo ICT Swing Structure trên 15m.
+
+        Logic:
+        - Bullish bias: chuỗi Higher High + Higher Low (uptrend structure)
+        - Bearish bias: chuỗi Lower High + Lower Low (downtrend structure)
+        - Cần ít nhất 2 swing high + 2 swing low gần nhất để xác định.
+        - Fallback về EMA nếu không đủ swing points.
         """
-        candles_15m = self.get_candles(SYMBOL, resolution="15m", count=60)
-        if not candles_15m or len(candles_15m) < 50:
+        candles_15m = self.get_candles(SYMBOL, resolution="15", count=80)
+        if not candles_15m or len(candles_15m) < 20:
             print("⚠️ Không đủ nến 15m để tính HTF bias — bỏ qua filter.")
-            return None  # Không đủ data thì không chặn tín hiệu
+            return None
 
-        # API trả nến theo thứ tự mới → cũ, cần đảo ngược để EMA tính đúng
-        closes = [c["close"] for c in reversed(candles_15m)]
+        # API trả mới → cũ, đảo ngược để index tăng dần theo thời gian
+        candles_chron = list(reversed(candles_15m))
 
-        ema20 = self._ema(closes, 20)
-        ema50 = self._ema(closes, 50)
+        swings = self._find_swing_points(candles_chron, lookback=3)
 
+        highs = [s for s in swings if s["type"] == "high"]
+        lows  = [s for s in swings if s["type"] == "low"]
+
+        if len(highs) >= 2 and len(lows) >= 2:
+            last_two_highs = highs[-2:]
+            last_two_lows  = lows[-2:]
+
+            hh = last_two_highs[1]["price"] > last_two_highs[0]["price"]  # Higher High
+            hl = last_two_lows[1]["price"]  > last_two_lows[0]["price"]   # Higher Low
+            lh = last_two_highs[1]["price"] < last_two_highs[0]["price"]  # Lower High
+            ll = last_two_lows[1]["price"]  < last_two_lows[0]["price"]   # Lower Low
+
+            if hh and hl:
+                print(f"   📈 HTF Bias: BULLISH (HH + HL structure trên 15m)")
+                return "bull"
+            if lh and ll:
+                print(f"   📉 HTF Bias: BEARISH (LH + LL structure trên 15m)")
+                return "bear"
+
+            # Partial structure — chỉ một điều kiện đúng, dùng EMA làm tiebreaker
+            print("   ↔️ HTF Swing structure không rõ ràng — dùng EMA làm tiebreaker.")
+
+        # Fallback EMA khi không đủ swing points hoặc structure không rõ
+        closes = [c["close"] for c in candles_chron]
+        ema20  = self._ema(closes, 20)
+        ema50  = self._ema(closes, 50)
         if ema20 > ema50:
             return "bull"
         elif ema20 < ema50:
@@ -806,23 +1055,28 @@ class TradeLockerTokenBot:
 
         final_lot = max(0.05, round(calculated_lot, 2))
 
-        url = f"{BASE_URL}/trade/order"
-        headers = {"Authorization": f"Bearer {self.access_token}"}
+        url = f"{BASE_URL}/trade/orders"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
         payload = {
             "accId":      self.acc_id,
-            "symbol":     SYMBOL,
-            "side":       side,
+            "instrument": SYMBOL,          # TradeLocker dùng "instrument" không phải "symbol"
+            "side":       side,            # "buy" / "sell"
             "type":       "market",
-            "quantity":   final_lot,
+            "qty":        final_lot,       # TradeLocker dùng "qty" không phải "quantity"
             "stopLoss":   round(sl_price, 2),
             "takeProfit": round(tp_price, 2),
         }
 
         try:
             order_res = requests.post(url, json=payload, headers=headers)
-            if order_res.status_code == 200:
+            if order_res.status_code in (200, 201):
                 order_data = order_res.json()
-                order_id   = str(order_data.get("orderId", order_data.get("id", "")))
+                # TradeLocker thường wrap response trong "d": {"orderId": ...}
+                d = order_data.get("d", order_data)
+                order_id = str(d.get("orderId", d.get("id", order_data.get("orderId", ""))))
                 print(f"🚀 [VÀO LỆNH THÀNH CÔNG] {side.upper()} {SYMBOL}! Lot: {final_lot}  ID: {order_id}")
                 self.log_trade(side, entry_price, sl_price, tp_price, final_lot, order_id)
                 if order_id:
@@ -908,6 +1162,12 @@ class TradeLockerTokenBot:
             print("⏸️  Bot đang tạm dừng. Gõ /resume trên Telegram để tiếp tục.", end="\r")
             return
 
+        # [NEW 1] Session filter — ngày lễ, cuối tuần, NFP Friday
+        allowed, reason = is_trading_allowed()
+        if not allowed:
+            print(f"🚫 {reason}", end="\r")
+            return
+
         # Kiểm tra giới hạn rủi ro ngày
         today_risk = risk_deployed_today()
         if today_risk >= self.daily_loss_limit:
@@ -942,8 +1202,8 @@ class TradeLockerTokenBot:
             print(f"🔒 Đã vào lệnh trong kill zone {kz} hôm nay — chờ kill zone tiếp theo.", end="\r")
             return
 
-        nas_candles = self.get_candles(SYMBOL)
-        es_candles  = self.get_candles(SYMBOL_ES)
+        nas_candles = self.get_candles(SYMBOL,    resolution="1", count=50)
+        es_candles  = self.get_candles(SYMBOL_ES, resolution="1", count=50)
 
         signal, sl_price = self.check_smt_divergence(nas_candles, es_candles)
 
@@ -1030,6 +1290,15 @@ if __name__ == "__main__":
                 if now_ny.hour == DAILY_SUMMARY_HOUR and bot.last_summary_date != today_date:
                     bot.last_summary_date = today_date
                     send_daily_summary()
+
+                # [NEW 1] Cảnh báo NFP Friday lúc 8AM NY
+                if now_ny.hour == 8 and is_nfp_friday() and bot.last_summary_date != today_date + "_nfp":
+                    bot.last_summary_date = today_date + "_nfp"
+                    send_telegram(
+                        "📰 <b>HÔM NAY LÀ THỨ SÁU NFP!</b>\n\n"
+                        "Bot sẽ <b>không trade</b> hôm nay do nguy cơ biến động đột ngột.\n"
+                        "Phiên tiếp theo: Thứ Hai tuần sau."
+                    )
 
                 if now_ny.hour == 9 and last_expiry_check_date != today_date:
                     last_expiry_check_date = today_date
