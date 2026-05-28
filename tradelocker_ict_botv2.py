@@ -939,16 +939,18 @@ class TradeLockerTokenBot:
     def check_killzone(self):
         tz_ny = pytz.timezone("America/New_York")
         current_time = datetime.now(tz_ny).strftime("%H:%M")
-        in_london = "03:00" <= current_time <= "04:00"
-        in_ny     = "09:30" <= current_time <= "10:30"
+        # London Open: 3:00–4:30 AM NY (nới thêm 30 phút)
+        in_london = "03:00" <= current_time <= "04:30"
+        # NY Open: 8:30–11:00 AM NY (bắt đầu từ pre-market, thêm 30 phút sau)
+        in_ny     = "08:30" <= current_time <= "11:00"
         return in_london or in_ny
 
     def current_killzone_name(self):
         tz_ny = pytz.timezone("America/New_York")
         current_time = datetime.now(tz_ny).strftime("%H:%M")
-        if "03:00" <= current_time <= "04:00":
+        if "03:00" <= current_time <= "04:30":
             return "London"
-        if "09:30" <= current_time <= "10:30":
+        if "08:30" <= current_time <= "11:00":
             return "NewYork"
         return None
 
@@ -1116,13 +1118,18 @@ class TradeLockerTokenBot:
         """
         THUẬT TOÁN ICT: LIQUIDITY SWEPT + SMT DIVERGENCE
 
-        Cải tiến so với phiên bản cũ:
-        - [FIX A] SL có buffer 0.03% để tránh bị sweep ngay lập tức
-        - MSS confirmation: close phải vượt swing high/low 5 nến trước,
-          không chỉ nến liền kề (tránh engulf giả)
-        - HTF bias filter được xử lý bên ngoài tại run_strategy()
+        Thay đổi v4:
+        - MSS confirmation: 3 nến (giảm từ 5 — bắt kèo nhanh hơn)
+        - ES tolerance: 0.1% thay vì bằng nhau tuyệt đối
+          (thực tế ES không bao giờ giữ đúng tuyệt đối)
+        - Debug log chi tiết cho từng điều kiện
         """
-        if not nas_candles or not es_candles or len(nas_candles) < 35 or len(es_candles) < 35:
+        if not nas_candles or not es_candles:
+            print(f"   ⚠️ [SMT] Không lấy được nến — NAS: {len(nas_candles) if nas_candles else 0}  ES: {len(es_candles) if es_candles else 0}")
+            return None, None
+
+        if len(nas_candles) < 35 or len(es_candles) < 35:
+            print(f"   ⚠️ [SMT] Không đủ nến — NAS: {len(nas_candles)}  ES: {len(es_candles)} (cần 35)")
             return None, None
 
         nas_curr = nas_candles[0]
@@ -1134,31 +1141,43 @@ class TradeLockerTokenBot:
         es_prev_low   = min(c["low"]  for c in es_candles[1:31])
         es_prev_high  = max(c["high"] for c in es_candles[1:31])
 
-        # [FIX C] MSS confirmation: close phải vượt swing high/low của 5 nến trước
-        # (thay vì chỉ nến [1] — quá yếu, dễ bị engulf giả trigger)
-        mss_swing_high = max(c["high"] for c in nas_candles[1:6])  # swing 5 nến
-        mss_swing_low  = min(c["low"]  for c in nas_candles[1:6])
+        # MSS confirmation: 3 nến (giảm từ 5)
+        mss_swing_high = max(c["high"] for c in nas_candles[1:4])
+        mss_swing_low  = min(c["low"]  for c in nas_candles[1:4])
+
+        # ES tolerance 0.1% — ES không cần giữ đáy/đỉnh tuyệt đối
+        es_low_tolerance  = es_prev_low  * 1.001   # cho phép ES thấp hơn 0.1%
+        es_high_tolerance = es_prev_high * 0.999   # cho phép ES cao hơn 0.1%
+
+        # ── DEBUG: in trạng thái từng điều kiện mỗi lần scan ──
+        nas_swept_low  = nas_curr["low"]  < nas_prev_low
+        nas_swept_high = nas_curr["high"] > nas_prev_high
+        es_held_low    = es_curr["low"]   >= es_prev_low - (es_prev_low * 0.001)
+        es_held_high   = es_curr["high"]  <= es_prev_high + (es_prev_high * 0.001)
+        mss_bull       = nas_curr["close"] > mss_swing_high
+        mss_bear       = nas_curr["close"] < mss_swing_low
+
+        print(
+            f"   📊 NAS low={nas_curr['low']:.1f} prev_low={nas_prev_low:.1f} swept={'✅' if nas_swept_low else '❌'} | "
+            f"ES held_low={'✅' if es_held_low else '❌'} | MSS_bull={'✅' if mss_bull else '❌'}"
+        )
+        print(
+            f"   📊 NAS high={nas_curr['high']:.1f} prev_high={nas_prev_high:.1f} swept={'✅' if nas_swept_high else '❌'} | "
+            f"ES held_high={'✅' if es_held_high else '❌'} | MSS_bear={'✅' if mss_bear else '❌'}"
+        )
 
         # ── BUY SETUP ──
-        # NAS quét đáy 30 nến + ES giữ đáy + MSS: close trên swing high 5 nến
-        if (nas_curr["low"] < nas_prev_low
-                and es_curr["low"] >= es_prev_low
-                and nas_curr["close"] > mss_swing_high):
-
-            # [FIX A] SL đặt dưới đáy nến sweep thêm buffer 0.03%
+        if nas_swept_low and es_held_low and mss_bull:
             buffer   = nas_curr["low"] * SL_BUFFER_PCT
             sl_price = nas_curr["low"] - buffer
+            print(f"   🟢 [BUY SIGNAL] SL={sl_price:.2f}")
             return "buy", round(sl_price, 2)
 
         # ── SELL SETUP ──
-        # NAS quét đỉnh 30 nến + ES giữ đỉnh + MSS: close dưới swing low 5 nến
-        if (nas_curr["high"] > nas_prev_high
-                and es_curr["high"] <= es_prev_high
-                and nas_curr["close"] < mss_swing_low):
-
-            # [FIX A] SL đặt trên đỉnh nến sweep thêm buffer 0.03%
+        if nas_swept_high and es_held_high and mss_bear:
             buffer   = nas_curr["high"] * SL_BUFFER_PCT
             sl_price = nas_curr["high"] + buffer
+            print(f"   🔴 [SELL SIGNAL] SL={sl_price:.2f}")
             return "sell", round(sl_price, 2)
 
         return None, None
@@ -1167,17 +1186,20 @@ class TradeLockerTokenBot:
         # Reset cooldown kill zone nếu sang ngày mới
         self._reset_killzone_cooldown_if_new_day()
 
+        tz_ny    = pytz.timezone("America/New_York")
+        now_str  = datetime.now(tz_ny).strftime("%H:%M:%S")
+
         if self.paused:
-            print("⏸️  Bot đang tạm dừng. Gõ /resume trên Telegram để tiếp tục.", end="\r")
+            print(f"\r⏸️  [{now_str}] Bot tạm dừng — gõ /resume để tiếp tục.          ", end="")
             return
 
-        # [NEW 1] Session filter — ngày lễ, cuối tuần, NFP Friday
+        # Session filter
         allowed, reason = is_trading_allowed()
         if not allowed:
-            print(f"🚫 {reason}", end="\r")
+            print(f"\r🚫 [{now_str}] {reason}          ", end="")
             return
 
-        # Kiểm tra giới hạn rủi ro ngày
+        # Giới hạn rủi ro ngày
         today_risk = risk_deployed_today()
         if today_risk >= self.daily_loss_limit:
             if not self.paused:
@@ -1189,56 +1211,56 @@ class TradeLockerTokenBot:
                 )
             return
 
-        # Kiểm tra giới hạn số lệnh ngày
+        # Giới hạn số lệnh ngày
         trades_today = count_trades_today()
         if trades_today >= self.max_trades_per_day:
-            print(f"🔢 Đã đạt giới hạn {self.max_trades_per_day} lệnh/ngày. Bot chờ sang ngày mới.", end="\r")
+            print(f"\r🔢 [{now_str}] Đã đạt {trades_today}/{self.max_trades_per_day} lệnh/ngày.          ", end="")
             return
 
+        # Kill zone check
         if not self.check_killzone():
-            print("⏳ Ngoài Kill Zone (London 3–4AM | NY 9:30–10:30AM). Bot đứng chờ...", end="\r")
+            print(f"\r⏳ [{now_str}] Ngoài Kill Zone — chờ London(3–4:30AM) / NY(8:30–11AM).          ", end="")
             return
 
         kz = self.current_killzone_name()
 
-        # ──────────────────────────────────────────────────────
-        # [FIX B] Cooldown per kill zone
-        # Mỗi kill zone chỉ cho vào TỐI ĐA 1 lệnh/ngày
-        # Sau khi đã vào lệnh trong London thì bỏ qua toàn bộ
-        # London còn lại; tương tự cho NewYork
-        # ──────────────────────────────────────────────────────
+        # Cooldown per kill zone
         if kz and kz in self.traded_killzones_today:
-            print(f"🔒 Đã vào lệnh trong kill zone {kz} hôm nay — chờ kill zone tiếp theo.", end="\r")
+            print(f"\r🔒 [{now_str}] Kill zone {kz} đã có lệnh hôm nay — chờ phiên tiếp theo.          ", end="")
             return
 
+        # Lấy nến
         nas_candles = self.get_candles(SYMBOL,    resolution="1", count=50)
         es_candles  = self.get_candles(SYMBOL_ES, resolution="1", count=50)
 
+        print(f"\n🔎 [{now_str}] Đang scan SMT [{kz}] — NAS={len(nas_candles)} nến  ES={len(es_candles)} nến")
+
         signal, sl_price = self.check_smt_divergence(nas_candles, es_candles)
 
-        if signal:
-            # ──────────────────────────────────────────────────
-            # [FIX C] HTF Bias Filter
-            # Chỉ vào lệnh nếu 15m trend đồng hướng với signal
-            # ──────────────────────────────────────────────────
-            htf_bias = self.get_htf_bias()
-            if htf_bias is not None:
-                if signal == "buy" and htf_bias != "bull":
-                    print(f"🚫 [HTF FILTER] Tín hiệu BUY bị chặn — 15m trend đang GIẢM (bearish bias).", end="\r")
-                    return
-                if signal == "sell" and htf_bias != "bear":
-                    print(f"🚫 [HTF FILTER] Tín hiệu SELL bị chặn — 15m trend đang TĂNG (bullish bias).", end="\r")
-                    return
+        if not signal:
+            print(f"   ⏩ Không có tín hiệu — tiếp tục chờ...")
+            return
 
-            entry_price = nas_candles[0]["close"]
-            print(f"\n🔍 [SMT/{kz}] Kích hoạt tín hiệu {signal.upper()} | Entry: {entry_price:.2f}  SL: {sl_price:.2f}  HTF: {htf_bias or 'N/A'}")
-            self.execute_trade(signal, entry_price, sl_price)
+        # HTF Bias Filter
+        htf_bias = self.get_htf_bias()
+        if htf_bias is not None:
+            if signal == "buy" and htf_bias != "bull":
+                print(f"   🚫 [HTF FILTER] BUY bị chặn — 15m bias: {htf_bias}")
+                return
+            if signal == "sell" and htf_bias != "bear":
+                print(f"   🚫 [HTF FILTER] SELL bị chặn — 15m bias: {htf_bias}")
+                return
+        else:
+            print(f"   ℹ️ HTF bias không xác định — bỏ qua filter, tiếp tục vào lệnh.")
 
-            # [FIX B] Đánh dấu kill zone này đã có lệnh
-            if kz:
-                self.traded_killzones_today.add(kz)
+        entry_price = nas_candles[0]["close"]
+        print(f"   ✅ [{kz}] {signal.upper()} Entry={entry_price:.2f}  SL={sl_price:.2f}  HTF={htf_bias or 'N/A'}")
+        self.execute_trade(signal, entry_price, sl_price)
 
-            time.sleep(60)
+        if kz:
+            self.traded_killzones_today.add(kz)
+
+        time.sleep(60)
 
 
 if __name__ == "__main__":
